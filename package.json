@@ -1,0 +1,9 @@
+{
+  "name": "tg-radar",
+  "version": "1.0.0",
+  "description": "Pump.fun Telegram alert bot",
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev"
+  }
+}
