@@ -1,13 +1,10 @@
-// index.js - Render Background Worker
-// Runs continuously, polls pump.fun every 30 seconds
-// Sends Telegram alerts for new tokens with TG links
+// index.js - GitHub Actions version
+// Runs once every 10 minutes via GitHub Actions cron
+// Polls pump.fun for new tokens with Telegram links and alerts your group
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const PUMPFUN_API = 'https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false';
-const INTERVAL_MS = 30000; // 30 seconds
-
-const seenMints = new Set();
 
 function extractTelegram(token) {
   const fields = [token.telegram, token.website, token.description, token.twitter];
@@ -66,15 +63,27 @@ async function sendTelegramAlert(token, tgLink) {
   }
 }
 
-async function pollAndAlert() {
+async function main() {
+  console.log('🟢 TG Radar scanning pump.fun...');
+
+  if (!TELEGRAM_TOKEN || !CHAT_ID) {
+    console.error('❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
+    process.exit(1);
+  }
+
   try {
     const res = await fetch(PUMPFUN_API, {
-      headers: { 'Accept': 'application/json' }
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://pump.fun/',
+        'Origin': 'https://pump.fun'
+      }
     });
 
     if (!res.ok) {
       console.error('Pump.fun API error:', res.status);
-      return;
+      process.exit(1);
     }
 
     const data = await res.json();
@@ -83,8 +92,7 @@ async function pollAndAlert() {
     let alerted = 0;
 
     for (const token of tokens) {
-      if (!token.mint || seenMints.has(token.mint)) continue;
-      seenMints.add(token.mint);
+      if (!token.mint) continue;
 
       const tgLink = extractTelegram(token);
       if (!tgLink) continue;
@@ -92,30 +100,15 @@ async function pollAndAlert() {
       await sendTelegramAlert(token, tgLink);
       alerted++;
 
-      // Avoid Telegram rate limits
       await new Promise(r => setTimeout(r, 300));
     }
 
-    console.log(`[${new Date().toISOString()}] Scanned ${tokens.length} tokens, alerted ${alerted} new TG links`);
+    console.log(`✅ Scanned ${tokens.length} tokens, sent ${alerted} alerts`);
 
   } catch (err) {
-    console.error('Poll error:', err.message);
-  }
-}
-
-async function main() {
-  console.log('🟢 TG Radar started — polling pump.fun every 30 seconds');
-
-  if (!TELEGRAM_TOKEN || !CHAT_ID) {
-    console.error('❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variables');
+    console.error('Error:', err.message);
     process.exit(1);
   }
-
-  // Run immediately on start
-  await pollAndAlert();
-
-  // Then loop every 30 seconds
-  setInterval(pollAndAlert, INTERVAL_MS);
 }
 
 main();
