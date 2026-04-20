@@ -1,10 +1,11 @@
 // index.js - GitHub Actions version
-// Runs once every 10 minutes via GitHub Actions cron
-// Polls pump.fun for new tokens with Telegram links and alerts your group
+// Routes pump.fun request through proxy to bypass IP blocking
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const PUMPFUN_API = 'https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false';
+
+const PUMPFUN_URL = 'https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false';
+const PROXY_API = `https://api.allorigins.win/get?url=${encodeURIComponent(PUMPFUN_URL)}`;
 
 function extractTelegram(token) {
   const fields = [token.telegram, token.website, token.description, token.twitter];
@@ -64,7 +65,7 @@ async function sendTelegramAlert(token, tgLink) {
 }
 
 async function main() {
-  console.log('🟢 TG Radar scanning pump.fun...');
+  console.log('🟢 TG Radar scanning pump.fun via proxy...');
 
   if (!TELEGRAM_TOKEN || !CHAT_ID) {
     console.error('❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
@@ -72,22 +73,22 @@ async function main() {
   }
 
   try {
-    const res = await fetch(PUMPFUN_API, {
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://pump.fun/',
-        'Origin': 'https://pump.fun'
-      }
-    });
+    const res = await fetch(PROXY_API);
 
     if (!res.ok) {
-      console.error('Pump.fun API error:', res.status);
+      console.error('Proxy error:', res.status);
       process.exit(1);
     }
 
-    const data = await res.json();
-    const tokens = Array.isArray(data) ? data : (data.coins || []);
+    const wrapper = await res.json();
+    const tokens = JSON.parse(wrapper.contents);
+
+    if (!Array.isArray(tokens)) {
+      console.error('Unexpected format:', JSON.stringify(tokens).slice(0, 200));
+      process.exit(1);
+    }
+
+    console.log(`Found ${tokens.length} tokens`);
 
     let alerted = 0;
 
