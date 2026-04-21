@@ -1,17 +1,46 @@
 // index.js - GitHub Actions version
-// Alerts for new pump.fun tokens that have Twitter/X or website links
+// Strategy: Fetch recently launched tokens, check IPFS metadata for socials
+// Runs every 10 minutes via GitHub Actions cron
+// Uses a cache file to avoid double-alerting the same token
 
-import { WebSocket } from 'ws';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const LISTEN_DURATION_MS = 60000;
+const CACHE_FILE = 'seen_tokens.json';
 
+// Multiple IPFS gateways
 const IPFS_GATEWAYS = [
   'https://cloudflare-ipfs.com/ipfs/',
   'https://ipfs.io/ipfs/',
   'https://gateway.pinata.cloud/ipfs/',
 ];
+
+// Load seen tokens cache
+function loadCache() {
+  try {
+    if (existsSync(CACHE_FILE)) {
+      const data = JSON.parse(readFileSync(CACHE_FILE, 'utf8'));
+      // Only keep tokens from last 24 hours to prevent cache growing forever
+      const oneDayAgo = Date.now() - 86400000;
+      const filtered = {};
+      for (const [mint, timestamp] of Object.entries(data)) {
+        if (timestamp > oneDayAgo) filtered[mint] = timestamp;
+      }
+      return filtered;
+    }
+  } catch {}
+  return {};
+}
+
+// Save seen tokens cache
+function saveCache(cache) {
+  try {
+    writeFileSync(CACHE_FILE, JSON.stringify(cache));
+  } catch (e) {
+    console.error('Cache save error:', e.message);
+  }
+}
 
 function getIPFSHash(uri) {
   if (!uri) return null;
@@ -22,37 +51,37 @@ function getIPFSHash(uri) {
 
 async function fetchIPFSMetadata(uri) {
   const hash = getIPFSHash(uri);
-  const urls = hash
-    ? IPFS_GATEWAYS.map(g => g + hash)
-    : [uri];
+  const urls = hash ? IPFS_GATEWAYS.map(g => g + hash) : [uri];
 
   for (const url of urls) {
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
-      if (res.ok) return await res.json();
+      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      if (res.ok) {
+        const text = await res.text();
+        try { return JSON.parse(text); } catch {}
+      }
     } catch {}
   }
   return null;
 }
 
-function extractLinks(metadata) {
-  if (!metadata) return {};
-
+function extractSocials(metadata) {
+  if (!metadata) return null;
   const str = JSON.stringify(metadata);
 
-  // Extract Twitter/X
-  const twitterMatch = str.match(/https?:\/\/(twitter\.com|x\.com)\/[a-zA-Z0-9_]+/);
-  const twitter = twitterMatch ? twitterMatch[0] : null;
-
-  // Extract Telegram
   const tgMatch = str.match(/https?:\/\/t\.me\/[a-zA-Z0-9_@]+/);
+  const twMatch = str.match(/https?:\/\/(twitter\.com|x\.com)\/[a-zA-Z0-9_]+/);
+
+  // Website - exclude known non-project URLs
+  const excluded = /twitter|x\.com|t\.me|ipfs|pump\.fun|cloudflare|pinata|solana/i;
+  const webMatch = str.match(/https?:\/\/(?!.*(?:twitter|x\.com|t\.me|ipfs|pump\.fun|cloudflare|pinata|solana))[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s"',]*/);
+
   const telegram = tgMatch ? tgMatch[0] : null;
+  const twitter = twMatch ? twMatch[0] : null;
+  const website = webMatch && !excluded.test(webMatch[0]) ? webMatch[0] : null;
 
-  // Extract website (not twitter/x/t.me/ipfs/pump.fun)
-  const websiteMatch = str.match(/https?:\/\/(?!twitter|x\.com|t\.me|ipfs|pump\.fun|cloudflare|gateway)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s"']*/);
-  const website = websiteMatch ? websiteMatch[0] : null;
-
-  return { twitter, telegram, website };
+  if (!telegram && !twitter && !website) return null;
+  return { telegram, twitter, website };
 }
 
 function formatMcap(solAmount) {
@@ -63,14 +92,14 @@ function formatMcap(solAmount) {
   return '$' + usd.toFixed(0);
 }
 
-async function sendTelegramAlert(token, links) {
-  const mcap = formatMcap(token.marketCapSol);
+async function sendTelegramAlert(token, socials) {
+  const mcap = formatMcap(token.marketCapSol || token.usd_market_cap);
   const ca = token.mint || 'N/A';
   const name = token.name || 'Unknown';
   const ticker = token.symbol || '???';
 
   const lines = [
-    `🟢 *NEW MEMECOIN DETECTED*`,
+    `🟢 *NEW MEMECOIN WITH SOCIALS*`,
     ``,
     `*${name}* — $${ticker}`,
     `💰 Market Cap: ${mcap}`,
@@ -78,12 +107,13 @@ async function sendTelegramAlert(token, links) {
     ``,
   ];
 
-  if (links.telegram) lines.push(`📱 Telegram: ${links.telegram}`);
-  if (links.twitter) lines.push(`🐦 Twitter: ${links.twitter}`);
-  if (links.website) lines.push(`🌐 Website: ${links.website}`);
+  if (socials.telegram) lines.push(`📱 Telegram: ${socials.telegram}`);
+  if (socials.twitter) lines.push(`🐦 Twitter: ${socials.twitter}`);
+  if (socials.website) lines.push(`🌐 Website: ${socials.website}`);
 
+  lines.push(``);
   lines.push(`🔗 Pump.fun: https://pump.fun/${ca}`);
-  lines.push(`⏱ Just launched`);
+  lines.push(`⏱ Recently launched`);
 
   const message = lines.join('\n');
   const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
@@ -100,84 +130,96 @@ async function sendTelegramAlert(token, links) {
       })
     });
     if (!res.ok) console.error('Telegram error:', await res.text());
-    else console.log(`✅ ALERT: ${name} ($${ticker})`);
+    else console.log(`✅ Alert: ${name} ($${ticker})`);
   } catch (err) {
     console.error('Failed to send:', err.message);
   }
 }
 
-async function processToken(token) {
-  const name = token.name || '???';
+async function fetchRecentTokens() {
+  // Fetch last 50 tokens from pumpportal REST endpoint
+  const urls = [
+    'https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false',
+    'https://frontend-api-v2.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false',
+    'https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false',
+  ];
 
-  if (!token.uri) {
-    console.log(`  ⚠ No URI: ${name}`);
-    return;
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        },
+        signal: AbortSignal.timeout(10000)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const tokens = Array.isArray(data) ? data : (data.coins || []);
+        if (tokens.length > 0) {
+          console.log(`Got ${tokens.length} tokens from ${url}`);
+          return tokens;
+        }
+      }
+    } catch (e) {
+      console.log(`Failed ${url}: ${e.message}`);
+    }
   }
-
-  const metadata = await fetchIPFSMetadata(token.uri);
-  if (!metadata) {
-    console.log(`  ⚠ IPFS failed: ${name}`);
-    return;
-  }
-
-  const links = extractLinks(metadata);
-  const hasAnyLink = links.telegram || links.twitter || links.website;
-
-  if (!hasAnyLink) {
-    console.log(`  ❌ No links: ${name}`);
-    return;
-  }
-
-  console.log(`  🔗 ${name} → TG:${!!links.telegram} X:${!!links.twitter} WEB:${!!links.website}`);
-  await sendTelegramAlert(token, links);
+  return [];
 }
 
 async function main() {
-  console.log('🟢 TG Radar starting...');
+  console.log('🟢 TG Radar scanning recent tokens for socials...\n');
 
   if (!TELEGRAM_TOKEN || !CHAT_ID) {
     console.error('❌ Missing env vars');
     process.exit(1);
   }
 
-  return new Promise((resolve) => {
-    const ws = new WebSocket('wss://pumpportal.fun/api/data');
-    let tokenCount = 0;
-    const processingQueue = [];
+  const cache = loadCache();
+  console.log(`Cache has ${Object.keys(cache).length} already-seen tokens\n`);
 
-    ws.on('open', () => {
-      console.log('✅ Connected');
-      ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
-      console.log('👂 Listening for 60 seconds...\n');
+  const tokens = await fetchRecentTokens();
 
-      setTimeout(async () => {
-        ws.close();
-        console.log(`\nProcessing ${tokenCount} tokens...`);
-        await Promise.allSettled(processingQueue);
-        console.log('📊 Done.');
-        resolve();
-      }, LISTEN_DURATION_MS);
-    });
+  if (tokens.length === 0) {
+    console.log('No tokens fetched — API may be down');
+    process.exit(0);
+  }
 
-    ws.on('message', (data) => {
-      try {
-        const token = JSON.parse(data.toString());
-        if (!token.mint) return;
-        tokenCount++;
-        console.log(`[${tokenCount}] ${token.name || '???'}`);
-        processingQueue.push(processToken(token));
-      } catch (err) {
-        console.error('Parse error:', err.message);
-      }
-    });
+  let checked = 0;
+  let alerted = 0;
+  let skipped = 0;
 
-    ws.on('error', (err) => {
-      console.error('WebSocket error:', err.message);
-      resolve();
-    });
+  for (const token of tokens) {
+    if (!token.mint || !token.uri) continue;
 
-    ws.on('close', () => console.log('WebSocket closed'));
-  });
+    // Skip already alerted tokens
+    if (cache[token.mint]) {
+      skipped++;
+      continue;
+    }
+
+    checked++;
+    const metadata = await fetchIPFSMetadata(token.uri);
+    const socials = extractSocials(metadata);
+
+    if (socials) {
+      await sendTelegramAlert(token, socials);
+      cache[token.mint] = Date.now();
+      alerted++;
+      await new Promise(r => setTimeout(r, 500));
+    } else {
+      // Mark as seen even without socials so we don't keep checking
+      cache[token.mint] = Date.now();
+      console.log(`No socials: ${token.name || token.mint}`);
+    }
+  }
+
+  saveCache(cache);
+  console.log(`\n📊 Done. Checked ${checked} tokens, sent ${alerted} alerts, skipped ${skipped} cached`);
 }
 
-main().then(() => process.exit(0));
+main().then(() => process.exit(0)).catch(err => {
+  console.error('Fatal:', err.message);
+  process.exit(1);
+});
