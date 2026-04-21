@@ -1,5 +1,5 @@
 // index.js - GitHub Actions version
-// Connects to pumpportal WebSocket, fetches IPFS metadata, sends TG alerts
+// Alerts for new pump.fun tokens that have Twitter/X or website links
 
 import { WebSocket } from 'ws';
 
@@ -7,32 +7,11 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const LISTEN_DURATION_MS = 60000;
 
-// Multiple IPFS gateways to try in order
 const IPFS_GATEWAYS = [
   'https://cloudflare-ipfs.com/ipfs/',
   'https://ipfs.io/ipfs/',
   'https://gateway.pinata.cloud/ipfs/',
 ];
-
-function extractTelegram(obj) {
-  if (!obj) return null;
-  // Check direct fields first
-  if (obj.telegram && typeof obj.telegram === 'string' && obj.telegram.includes('t.me')) {
-    return obj.telegram.startsWith('http') ? obj.telegram : 'https://' + obj.telegram;
-  }
-  // Search entire JSON string for any t.me link
-  const str = JSON.stringify(obj);
-  const match = str.match(/https?:\/\/t\.me\/[a-zA-Z0-9_@]+/);
-  return match ? match[0] : null;
-}
-
-function formatMcap(solAmount) {
-  if (!solAmount) return 'Unknown';
-  const usd = solAmount * 150;
-  if (usd >= 1_000_000) return '$' + (usd / 1_000_000).toFixed(1) + 'M';
-  if (usd >= 1000) return '$' + (usd / 1000).toFixed(1) + 'K';
-  return '$' + usd.toFixed(0);
-}
 
 function getIPFSHash(uri) {
   if (!uri) return null;
@@ -43,46 +22,70 @@ function getIPFSHash(uri) {
 
 async function fetchIPFSMetadata(uri) {
   const hash = getIPFSHash(uri);
-  if (!hash) {
-    // Try direct URL fetch
-    try {
-      const res = await fetch(uri, { signal: AbortSignal.timeout(6000) });
-      if (res.ok) return await res.json();
-    } catch {}
-    return null;
-  }
+  const urls = hash
+    ? IPFS_GATEWAYS.map(g => g + hash)
+    : [uri];
 
-  // Try each gateway
-  for (const gateway of IPFS_GATEWAYS) {
+  for (const url of urls) {
     try {
-      const url = gateway + hash;
       const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
-      if (res.ok) {
-        const data = await res.json();
-        return data;
-      }
+      if (res.ok) return await res.json();
     } catch {}
   }
   return null;
 }
 
-async function sendTelegramAlert(token, tgLink, metadata) {
+function extractLinks(metadata) {
+  if (!metadata) return {};
+
+  const str = JSON.stringify(metadata);
+
+  // Extract Twitter/X
+  const twitterMatch = str.match(/https?:\/\/(twitter\.com|x\.com)\/[a-zA-Z0-9_]+/);
+  const twitter = twitterMatch ? twitterMatch[0] : null;
+
+  // Extract Telegram
+  const tgMatch = str.match(/https?:\/\/t\.me\/[a-zA-Z0-9_@]+/);
+  const telegram = tgMatch ? tgMatch[0] : null;
+
+  // Extract website (not twitter/x/t.me/ipfs/pump.fun)
+  const websiteMatch = str.match(/https?:\/\/(?!twitter|x\.com|t\.me|ipfs|pump\.fun|cloudflare|gateway)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s"']*/);
+  const website = websiteMatch ? websiteMatch[0] : null;
+
+  return { twitter, telegram, website };
+}
+
+function formatMcap(solAmount) {
+  if (!solAmount) return 'Unknown';
+  const usd = solAmount * 150;
+  if (usd >= 1_000_000) return '$' + (usd / 1_000_000).toFixed(1) + 'M';
+  if (usd >= 1000) return '$' + (usd / 1000).toFixed(1) + 'K';
+  return '$' + usd.toFixed(0);
+}
+
+async function sendTelegramAlert(token, links) {
   const mcap = formatMcap(token.marketCapSol);
   const ca = token.mint || 'N/A';
-  const name = token.name || metadata?.name || 'Unknown';
-  const ticker = token.symbol || metadata?.symbol || '???';
+  const name = token.name || 'Unknown';
+  const ticker = token.symbol || '???';
 
-  const message = `🟢 *NEW MEMECOIN DETECTED*
+  const lines = [
+    `🟢 *NEW MEMECOIN DETECTED*`,
+    ``,
+    `*${name}* — $${ticker}`,
+    `💰 Market Cap: ${mcap}`,
+    `📋 CA: \`${ca}\``,
+    ``,
+  ];
 
-*${name}* — $${ticker}
-💰 Market Cap: ${mcap}
-📋 CA: \`${ca}\`
+  if (links.telegram) lines.push(`📱 Telegram: ${links.telegram}`);
+  if (links.twitter) lines.push(`🐦 Twitter: ${links.twitter}`);
+  if (links.website) lines.push(`🌐 Website: ${links.website}`);
 
-📱 *Telegram:* ${tgLink}
-🔗 *Pump.fun:* https://pump.fun/${ca}
+  lines.push(`🔗 Pump.fun: https://pump.fun/${ca}`);
+  lines.push(`⏱ Just launched`);
 
-⏱ Just launched on pump.fun`;
-
+  const message = lines.join('\n');
   const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
 
   try {
@@ -97,14 +100,14 @@ async function sendTelegramAlert(token, tgLink, metadata) {
       })
     });
     if (!res.ok) console.error('Telegram error:', await res.text());
-    else console.log(`✅ ALERT SENT: ${name} ($${ticker}) → ${tgLink}`);
+    else console.log(`✅ ALERT: ${name} ($${ticker})`);
   } catch (err) {
     console.error('Failed to send:', err.message);
   }
 }
 
 async function processToken(token) {
-  const name = token.name || token.mint?.slice(0, 8);
+  const name = token.name || '???';
 
   if (!token.uri) {
     console.log(`  ⚠ No URI: ${name}`);
@@ -112,29 +115,28 @@ async function processToken(token) {
   }
 
   const metadata = await fetchIPFSMetadata(token.uri);
-
   if (!metadata) {
     console.log(`  ⚠ IPFS failed: ${name}`);
     return;
   }
 
-  console.log(`  📄 Metadata fields: ${Object.keys(metadata).join(', ')}`);
+  const links = extractLinks(metadata);
+  const hasAnyLink = links.telegram || links.twitter || links.website;
 
-  const tgLink = extractTelegram(metadata);
-  if (!tgLink) {
-    console.log(`  ❌ No TG: ${name}`);
+  if (!hasAnyLink) {
+    console.log(`  ❌ No links: ${name}`);
     return;
   }
 
-  console.log(`  🔗 Found TG: ${tgLink}`);
-  await sendTelegramAlert(token, tgLink, metadata);
+  console.log(`  🔗 ${name} → TG:${!!links.telegram} X:${!!links.twitter} WEB:${!!links.website}`);
+  await sendTelegramAlert(token, links);
 }
 
 async function main() {
   console.log('🟢 TG Radar starting...');
 
   if (!TELEGRAM_TOKEN || !CHAT_ID) {
-    console.error('❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
+    console.error('❌ Missing env vars');
     process.exit(1);
   }
 
@@ -144,7 +146,7 @@ async function main() {
     const processingQueue = [];
 
     ws.on('open', () => {
-      console.log('✅ Connected to pumpportal.fun');
+      console.log('✅ Connected');
       ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
       console.log('👂 Listening for 60 seconds...\n');
 
@@ -152,7 +154,7 @@ async function main() {
         ws.close();
         console.log(`\nProcessing ${tokenCount} tokens...`);
         await Promise.allSettled(processingQueue);
-        console.log('\n📊 Done.');
+        console.log('📊 Done.');
         resolve();
       }, LISTEN_DURATION_MS);
     });
@@ -162,8 +164,7 @@ async function main() {
         const token = JSON.parse(data.toString());
         if (!token.mint) return;
         tokenCount++;
-        console.log(`\n[${tokenCount}] ${token.name || '???'} (${token.symbol || '???'})`);
-        console.log(`  URI: ${token.uri?.slice(0, 60)}...`);
+        console.log(`[${tokenCount}] ${token.name || '???'}`);
         processingQueue.push(processToken(token));
       } catch (err) {
         console.error('Parse error:', err.message);
