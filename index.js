@@ -1,16 +1,25 @@
 // index.js - GitHub Actions version
-// Uses ScraperAPI to bypass pump.fun IP blocking
+// Uses pumpportal.fun - free public API that mirrors pump.fun data
+// No blocking, no proxies needed
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const SCRAPER_KEY = process.env.SCRAPER_API_KEY;
 
-const PUMPFUN_URL = 'https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false';
+const API_URL = 'https://pumpportal.fun/api/data/tokens?limit=50&sort=created&order=desc';
 
 function extractTelegram(token) {
-  const fields = [token.telegram, token.website, token.description, token.twitter];
+  const fields = [
+    token.telegram,
+    token.twitter,
+    token.website,
+    token.description,
+    token.metadata?.telegram,
+    token.metadata?.twitter,
+    token.metadata?.website,
+    token.metadata?.description,
+  ];
   for (const f of fields) {
-    if (!f) continue;
+    if (!f || typeof f !== 'string') continue;
     const match = f.match(/(?:https?:\/\/)?t\.me\/([a-zA-Z0-9_]+)/);
     if (match) return 'https://t.me/' + match[1];
   }
@@ -25,8 +34,8 @@ function formatMcap(val) {
 }
 
 async function sendTelegramAlert(token, tgLink) {
-  const mcap = formatMcap(token.usd_market_cap);
-  const ca = token.mint || 'N/A';
+  const mcap = formatMcap(token.usd_market_cap || token.market_cap);
+  const ca = token.mint || token.address || 'N/A';
   const name = token.name || 'Unknown';
   const ticker = token.symbol || '???';
 
@@ -61,56 +70,49 @@ async function sendTelegramAlert(token, tgLink) {
 }
 
 async function main() {
-  console.log('🟢 TG Radar scanning pump.fun via ScraperAPI...');
+  console.log('🟢 TG Radar scanning via pumpportal.fun...');
 
   if (!TELEGRAM_TOKEN || !CHAT_ID) {
     console.error('❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
     process.exit(1);
   }
 
-  if (!SCRAPER_KEY) {
-    console.error('❌ Missing SCRAPER_API_KEY');
-    process.exit(1);
-  }
-
   try {
-    const scraperUrl = `http://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(PUMPFUN_URL)}`;
-
-    const res = await fetch(scraperUrl);
+    const res = await fetch(API_URL, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0'
+      }
+    });
 
     if (!res.ok) {
-      console.error('ScraperAPI error:', res.status, await res.text());
+      const text = await res.text();
+      console.error('API error:', res.status, text.slice(0, 200));
       process.exit(1);
     }
 
     const text = await res.text();
+    console.log('Raw response preview:', text.slice(0, 200));
 
-    let tokens;
+    let data;
     try {
-      tokens = JSON.parse(text);
+      data = JSON.parse(text);
     } catch (e) {
-      console.error('Failed to parse response:', text.slice(0, 300));
+      console.error('Failed to parse JSON:', text.slice(0, 300));
       process.exit(1);
     }
 
-    if (!Array.isArray(tokens)) {
-      console.error('Unexpected format:', JSON.stringify(tokens).slice(0, 200));
-      process.exit(1);
-    }
-
+    const tokens = Array.isArray(data) ? data : (data.tokens || data.data || data.results || []);
     console.log(`Found ${tokens.length} tokens`);
 
     let alerted = 0;
 
     for (const token of tokens) {
-      if (!token.mint) continue;
-
       const tgLink = extractTelegram(token);
       if (!tgLink) continue;
 
       await sendTelegramAlert(token, tgLink);
       alerted++;
-
       await new Promise(r => setTimeout(r, 300));
     }
 
