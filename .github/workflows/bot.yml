@@ -2,8 +2,8 @@ name: TG Radar Bot
 
 on:
   schedule:
-    - cron: '*/10 * * * *'  # Runs every 10 minutes
-  workflow_dispatch:          # Allows manual trigger
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
 
 jobs:
   scan:
@@ -17,11 +17,12 @@ jobs:
         with:
           node-version: '18'
 
+      - name: Install dependencies
+        run: npm install
+
       - name: Run TG Radar
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
-          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
         run: node index.js
         timeout-minutes: 8
