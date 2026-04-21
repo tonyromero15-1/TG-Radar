@@ -1,11 +1,12 @@
 // index.js - GitHub Actions version
-// Uses pumpportal.fun - free public API that mirrors pump.fun data
-// No blocking, no proxies needed
+// Connects to pumpportal.fun WebSocket, collects new tokens for 60 seconds
+// Sends Telegram alerts for any token that has a Telegram link
+
+import { WebSocket } from 'ws';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-
-const API_URL = 'https://pumpportal.fun/api/data/tokens?limit=50&sort=created&order=desc';
+const LISTEN_DURATION_MS = 60000; // Listen for 60 seconds then exit
 
 function extractTelegram(token) {
   const fields = [
@@ -14,7 +15,6 @@ function extractTelegram(token) {
     token.website,
     token.description,
     token.metadata?.telegram,
-    token.metadata?.twitter,
     token.metadata?.website,
     token.metadata?.description,
   ];
@@ -34,8 +34,8 @@ function formatMcap(val) {
 }
 
 async function sendTelegramAlert(token, tgLink) {
-  const mcap = formatMcap(token.usd_market_cap || token.market_cap);
-  const ca = token.mint || token.address || 'N/A';
+  const mcap = formatMcap(token.usdMarketCap || token.usd_market_cap);
+  const ca = token.mint || 'N/A';
   const name = token.name || 'Unknown';
   const ticker = token.symbol || '???';
 
@@ -64,64 +64,80 @@ async function sendTelegramAlert(token, tgLink) {
       })
     });
     if (!res.ok) console.error('Telegram error:', await res.text());
+    else console.log(`✅ Alert sent for ${name} ($${ticker})`);
   } catch (err) {
     console.error('Failed to send:', err.message);
   }
 }
 
 async function main() {
-  console.log('🟢 TG Radar scanning via pumpportal.fun...');
+  console.log('🟢 TG Radar connecting to pumpportal WebSocket...');
 
   if (!TELEGRAM_TOKEN || !CHAT_ID) {
     console.error('❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
     process.exit(1);
   }
 
-  try {
-    const res = await fetch(API_URL, {
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0'
+  return new Promise((resolve) => {
+    const ws = new WebSocket('wss://pumpportal.fun/api/data');
+    let tokenCount = 0;
+    let alertCount = 0;
+    const queue = [];
+    let processing = false;
+
+    async function processQueue() {
+      if (processing) return;
+      processing = true;
+      while (queue.length > 0) {
+        const { token, tgLink } = queue.shift();
+        await sendTelegramAlert(token, tgLink);
+        await new Promise(r => setTimeout(r, 300));
+      }
+      processing = false;
+    }
+
+    ws.on('open', () => {
+      console.log('✅ Connected to pumpportal.fun');
+      // Subscribe to new token creations
+      ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+      console.log('👂 Listening for new tokens for 60 seconds...');
+
+      // Close after 60 seconds
+      setTimeout(() => {
+        ws.close();
+        console.log(`\n📊 Done. Saw ${tokenCount} tokens, sent ${alertCount} alerts`);
+        resolve();
+      }, LISTEN_DURATION_MS);
+    });
+
+    ws.on('message', async (data) => {
+      try {
+        const token = JSON.parse(data.toString());
+        if (!token.mint) return;
+
+        tokenCount++;
+        const tgLink = extractTelegram(token);
+
+        if (tgLink) {
+          alertCount++;
+          queue.push({ token, tgLink });
+          processQueue();
+        }
+      } catch (err) {
+        console.error('Parse error:', err.message);
       }
     });
 
-    if (!res.ok) {
-      const text = await res.text();
-      console.error('API error:', res.status, text.slice(0, 200));
-      process.exit(1);
-    }
+    ws.on('error', (err) => {
+      console.error('WebSocket error:', err.message);
+      resolve();
+    });
 
-    const text = await res.text();
-    console.log('Raw response preview:', text.slice(0, 200));
-
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch (e) {
-      console.error('Failed to parse JSON:', text.slice(0, 300));
-      process.exit(1);
-    }
-
-    const tokens = Array.isArray(data) ? data : (data.tokens || data.data || data.results || []);
-    console.log(`Found ${tokens.length} tokens`);
-
-    let alerted = 0;
-
-    for (const token of tokens) {
-      const tgLink = extractTelegram(token);
-      if (!tgLink) continue;
-
-      await sendTelegramAlert(token, tgLink);
-      alerted++;
-      await new Promise(r => setTimeout(r, 300));
-    }
-
-    console.log(`✅ Scanned ${tokens.length} tokens, sent ${alerted} alerts`);
-
-  } catch (err) {
-    console.error('Error:', err.message);
-    process.exit(1);
-  }
+    ws.on('close', () => {
+      console.log('WebSocket closed');
+      resolve();
+    });
+  });
 }
 
-main();
+main().then(() => process.exit(0));
