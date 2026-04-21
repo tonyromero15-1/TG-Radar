@@ -1,11 +1,13 @@
 {
   "name": "tg-radar",
   "version": "1.0.0",
-  "description": "Pump.fun Telegram alert bot",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
   },
   "engines": {
     "node": ">=18"
