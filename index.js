@@ -1,46 +1,24 @@
 // index.js - GitHub Actions version
-// Strategy: Fetch recently launched tokens, check IPFS metadata for socials
-// Runs every 10 minutes via GitHub Actions cron
-// Uses a cache file to avoid double-alerting the same token
+// Sources: pumpportal WebSocket (pump.fun) + DexScreener new pairs API
+// Filter: under $50K mcap, must have Telegram or Twitter
+// Priority: Telegram > Twitter > Website
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { WebSocket } from 'ws';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const CACHE_FILE = 'seen_tokens.json';
+const LISTEN_DURATION_MS = 60000;
+const MAX_MCAP_USD = 50000;
 
-// Multiple IPFS gateways
 const IPFS_GATEWAYS = [
   'https://cloudflare-ipfs.com/ipfs/',
   'https://ipfs.io/ipfs/',
   'https://gateway.pinata.cloud/ipfs/',
 ];
 
-// Load seen tokens cache
-function loadCache() {
-  try {
-    if (existsSync(CACHE_FILE)) {
-      const data = JSON.parse(readFileSync(CACHE_FILE, 'utf8'));
-      // Only keep tokens from last 24 hours to prevent cache growing forever
-      const oneDayAgo = Date.now() - 86400000;
-      const filtered = {};
-      for (const [mint, timestamp] of Object.entries(data)) {
-        if (timestamp > oneDayAgo) filtered[mint] = timestamp;
-      }
-      return filtered;
-    }
-  } catch {}
-  return {};
-}
+const alertedMints = new Set();
 
-// Save seen tokens cache
-function saveCache(cache) {
-  try {
-    writeFileSync(CACHE_FILE, JSON.stringify(cache));
-  } catch (e) {
-    console.error('Cache save error:', e.message);
-  }
-}
+// ─── IPFS ────────────────────────────────────────────────────────────────────
 
 function getIPFSHash(uri) {
   if (!uri) return null;
@@ -52,57 +30,58 @@ function getIPFSHash(uri) {
 async function fetchIPFSMetadata(uri) {
   const hash = getIPFSHash(uri);
   const urls = hash ? IPFS_GATEWAYS.map(g => g + hash) : [uri];
-
   for (const url of urls) {
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      const res = await fetch(url, { signal: AbortSignal.timeout(7000) });
       if (res.ok) {
-        const text = await res.text();
-        try { return JSON.parse(text); } catch {}
+        try { return await res.json(); } catch {}
       }
     } catch {}
   }
   return null;
 }
 
-function extractSocials(metadata) {
-  if (!metadata) return null;
-  const str = JSON.stringify(metadata);
+// ─── SOCIAL EXTRACTION ───────────────────────────────────────────────────────
 
-  const tgMatch = str.match(/https?:\/\/t\.me\/[a-zA-Z0-9_@]+/);
+function extractSocials(data) {
+  if (!data) return null;
+  const str = JSON.stringify(data);
+
+  const tgMatch = str.match(/https?:\/\/t\.me\/[a-zA-Z0-9_@+]+/);
   const twMatch = str.match(/https?:\/\/(twitter\.com|x\.com)\/[a-zA-Z0-9_]+/);
-
-  // Website - exclude known non-project URLs
-  const excluded = /twitter|x\.com|t\.me|ipfs|pump\.fun|cloudflare|pinata|solana/i;
-  const webMatch = str.match(/https?:\/\/(?!.*(?:twitter|x\.com|t\.me|ipfs|pump\.fun|cloudflare|pinata|solana))[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s"',]*/);
+  const webMatch = str.match(/https?:\/\/(?!.*(?:twitter|x\.com|t\.me|ipfs|pump\.fun|dexscreener|cloudflare|pinata|solana|arweave|birdeye|jupiter))[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s"',]*/);
 
   const telegram = tgMatch ? tgMatch[0] : null;
   const twitter = twMatch ? twMatch[0] : null;
-  const website = webMatch && !excluded.test(webMatch[0]) ? webMatch[0] : null;
+  const website = webMatch ? webMatch[0] : null;
 
-  if (!telegram && !twitter && !website) return null;
+  // Must have at least Telegram or Twitter
+  if (!telegram && !twitter) return null;
+
   return { telegram, twitter, website };
 }
 
-function formatMcap(solAmount) {
-  if (!solAmount) return 'Unknown';
-  const usd = solAmount * 150;
+// ─── FORMATTING ──────────────────────────────────────────────────────────────
+
+function formatMcap(usd) {
+  if (!usd) return 'Unknown';
   if (usd >= 1_000_000) return '$' + (usd / 1_000_000).toFixed(1) + 'M';
   if (usd >= 1000) return '$' + (usd / 1000).toFixed(1) + 'K';
   return '$' + usd.toFixed(0);
 }
 
-async function sendTelegramAlert(token, socials) {
-  const mcap = formatMcap(token.marketCapSol || token.usd_market_cap);
-  const ca = token.mint || 'N/A';
-  const name = token.name || 'Unknown';
-  const ticker = token.symbol || '???';
+// ─── TELEGRAM ALERT ──────────────────────────────────────────────────────────
+
+async function sendAlert(name, ticker, ca, mcapUsd, socials, source, pumpLink) {
+  const quality = socials.telegram && socials.twitter ? '🔥' : socials.telegram ? '📱' : '🐦';
+  const sourceTag = source === 'pumpfun' ? 'pump.fun' : 'DexScreener';
 
   const lines = [
-    `🟢 *NEW MEMECOIN WITH SOCIALS*`,
+    `${quality} *EARLY TOKEN ALERT*`,
+    `📡 Source: ${sourceTag}`,
     ``,
     `*${name}* — $${ticker}`,
-    `💰 Market Cap: ${mcap}`,
+    `💰 MCap: ${formatMcap(mcapUsd)}`,
     `📋 CA: \`${ca}\``,
     ``,
   ];
@@ -112,8 +91,7 @@ async function sendTelegramAlert(token, socials) {
   if (socials.website) lines.push(`🌐 Website: ${socials.website}`);
 
   lines.push(``);
-  lines.push(`🔗 Pump.fun: https://pump.fun/${ca}`);
-  lines.push(`⏱ Recently launched`);
+  lines.push(`🔗 ${pumpLink}`);
 
   const message = lines.join('\n');
   const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
@@ -130,93 +108,182 @@ async function sendTelegramAlert(token, socials) {
       })
     });
     if (!res.ok) console.error('Telegram error:', await res.text());
-    else console.log(`✅ Alert: ${name} ($${ticker})`);
+    else console.log(`✅ Alert: ${name} ($${ticker}) [${sourceTag}]`);
   } catch (err) {
     console.error('Failed to send:', err.message);
   }
 }
 
-async function fetchRecentTokens() {
-  // Fetch last 50 tokens from pumpportal REST endpoint
-  const urls = [
-    'https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false',
-    'https://frontend-api-v2.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false',
-    'https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false',
-  ];
+// ─── PUMP.FUN (WebSocket) ─────────────────────────────────────────────────────
 
-  for (const url of urls) {
-    try {
-      const res = await fetch(url, {
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        },
-        signal: AbortSignal.timeout(10000)
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const tokens = Array.isArray(data) ? data : (data.coins || []);
-        if (tokens.length > 0) {
-          console.log(`Got ${tokens.length} tokens from ${url}`);
-          return tokens;
-        }
-      }
-    } catch (e) {
-      console.log(`Failed ${url}: ${e.message}`);
-    }
+async function processPumpToken(token) {
+  const name = token.name || '???';
+  const ca = token.mint;
+
+  if (!ca || alertedMints.has(ca)) return;
+
+  // Mcap filter
+  const mcapUsd = (token.marketCapSol || 0) * 150;
+  if (mcapUsd > MAX_MCAP_USD && mcapUsd !== 0) {
+    console.log(`  Skip high mcap: ${name} (${formatMcap(mcapUsd)})`);
+    return;
   }
-  return [];
+
+  if (!token.uri) return;
+
+  const metadata = await fetchIPFSMetadata(token.uri);
+  const socials = extractSocials(metadata);
+
+  if (!socials) {
+    console.log(`  No socials: ${name}`);
+    return;
+  }
+
+  alertedMints.add(ca);
+  console.log(`  🎯 pump.fun match: ${name} TG:${!!socials.telegram} X:${!!socials.twitter}`);
+  await sendAlert(
+    name,
+    token.symbol || '???',
+    ca,
+    mcapUsd,
+    socials,
+    'pumpfun',
+    `https://pump.fun/${ca}`
+  );
 }
 
+async function scanPumpFun() {
+  return new Promise((resolve) => {
+    console.log('\n📡 Connecting to pump.fun WebSocket...');
+    const ws = new WebSocket('wss://pumpportal.fun/api/data');
+    let count = 0;
+    const queue = [];
+
+    ws.on('open', () => {
+      console.log('✅ pump.fun connected');
+      ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+
+      setTimeout(async () => {
+        ws.close();
+        await Promise.allSettled(queue);
+        console.log(`pump.fun: saw ${count} tokens`);
+        resolve();
+      }, LISTEN_DURATION_MS);
+    });
+
+    ws.on('message', (data) => {
+      try {
+        const token = JSON.parse(data.toString());
+        if (!token.mint) return;
+        count++;
+        console.log(`[pump] ${token.name || '???'}`);
+        queue.push(processPumpToken(token));
+      } catch {}
+    });
+
+    ws.on('error', (err) => {
+      console.error('pump.fun WS error:', err.message);
+      resolve();
+    });
+
+    ws.on('close', () => resolve());
+  });
+}
+
+// ─── DEXSCREENER (new pairs) ──────────────────────────────────────────────────
+
+async function scanDexScreener() {
+  console.log('\n📡 Scanning DexScreener new pairs...');
+
+  try {
+    // DexScreener latest token profiles endpoint - returns tokens with socials
+    const res = await fetch('https://api.dexscreener.com/token-profiles/latest/v1', {
+      headers: { 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(10000)
+    });
+
+    if (!res.ok) {
+      console.log('DexScreener error:', res.status);
+      return;
+    }
+
+    const tokens = await res.json();
+    if (!Array.isArray(tokens)) {
+      console.log('DexScreener unexpected format');
+      return;
+    }
+
+    console.log(`DexScreener: ${tokens.length} token profiles`);
+
+    for (const token of tokens) {
+      const ca = token.tokenAddress;
+      if (!ca || alertedMints.has(ca)) continue;
+
+      // Only Solana tokens
+      if (token.chainId !== 'solana') continue;
+
+      // Extract socials from DexScreener links array
+      const links = token.links || [];
+      let telegram = null;
+      let twitter = null;
+      let website = null;
+
+      for (const link of links) {
+        const url = link.url || '';
+        if (url.includes('t.me')) telegram = url;
+        else if (url.includes('twitter.com') || url.includes('x.com')) twitter = url;
+        else if (link.type === 'website') website = url;
+      }
+
+      // Also check description for t.me links
+      if (!telegram && token.description) {
+        const tgMatch = token.description.match(/https?:\/\/t\.me\/[a-zA-Z0-9_@+]+/);
+        if (tgMatch) telegram = tgMatch[0];
+      }
+
+      if (!telegram && !twitter) continue;
+
+      // No mcap filter here since DexScreener profiles don't always have mcap
+      alertedMints.add(ca);
+
+      console.log(`  🎯 dex match: ${token.description?.slice(0, 30) || ca}`);
+
+      await sendAlert(
+        token.description?.split('\n')[0]?.slice(0, 30) || 'Unknown',
+        ca.slice(0, 6),
+        ca,
+        null,
+        { telegram, twitter, website },
+        'dexscreener',
+        `https://dexscreener.com/solana/${ca}`
+      );
+
+      await new Promise(r => setTimeout(r, 400));
+    }
+
+  } catch (err) {
+    console.error('DexScreener error:', err.message);
+  }
+}
+
+// ─── MAIN ─────────────────────────────────────────────────────────────────────
+
 async function main() {
-  console.log('🟢 TG Radar scanning recent tokens for socials...\n');
+  console.log('🟢 TG Radar — scanning pump.fun + DexScreener');
+  console.log(`Filter: under $${MAX_MCAP_USD.toLocaleString()} mcap | needs Telegram or Twitter\n`);
 
   if (!TELEGRAM_TOKEN || !CHAT_ID) {
-    console.error('❌ Missing env vars');
+    console.error('❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
     process.exit(1);
   }
 
-  const cache = loadCache();
-  console.log(`Cache has ${Object.keys(cache).length} already-seen tokens\n`);
+  // Run both scanners simultaneously
+  await Promise.all([
+    scanPumpFun(),
+    scanDexScreener()
+  ]);
 
-  const tokens = await fetchRecentTokens();
-
-  if (tokens.length === 0) {
-    console.log('No tokens fetched — API may be down');
-    process.exit(0);
-  }
-
-  let checked = 0;
-  let alerted = 0;
-  let skipped = 0;
-
-  for (const token of tokens) {
-    if (!token.mint || !token.uri) continue;
-
-    // Skip already alerted tokens
-    if (cache[token.mint]) {
-      skipped++;
-      continue;
-    }
-
-    checked++;
-    const metadata = await fetchIPFSMetadata(token.uri);
-    const socials = extractSocials(metadata);
-
-    if (socials) {
-      await sendTelegramAlert(token, socials);
-      cache[token.mint] = Date.now();
-      alerted++;
-      await new Promise(r => setTimeout(r, 500));
-    } else {
-      // Mark as seen even without socials so we don't keep checking
-      cache[token.mint] = Date.now();
-      console.log(`No socials: ${token.name || token.mint}`);
-    }
-  }
-
-  saveCache(cache);
-  console.log(`\n📊 Done. Checked ${checked} tokens, sent ${alerted} alerts, skipped ${skipped} cached`);
+  console.log('\n📊 All done.');
 }
 
 main().then(() => process.exit(0)).catch(err => {
