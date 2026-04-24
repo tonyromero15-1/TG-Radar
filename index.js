@@ -1,30 +1,55 @@
 // index.js - GitHub Actions version
-// Sources: pumpportal (pump.fun Solana) + DexScreener (all chains)
-// Priority: Telegram > Website > Twitter/X account
-// Filter: under $50K mcap, Telegram required
+// Aggressive pump.fun scanner
+// - WebSocket for real-time new tokens
+// - REST API polling for recent tokens (catches what WebSocket misses)
+// - Under $20K mcap only
+// - Alerts for Telegram, Twitter, OR website
+// - Persistent cache to prevent duplicates
 
 import { WebSocket } from 'ws';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const LISTEN_DURATION_MS = 60000;
-const MAX_MCAP_USD = 50000;
+const MAX_MCAP_USD = 20000;
+const CACHE_FILE = 'seen_tokens.json';
 
 const IPFS_GATEWAYS = [
   'https://cloudflare-ipfs.com/ipfs/',
   'https://ipfs.io/ipfs/',
   'https://gateway.pinata.cloud/ipfs/',
+  'https://dweb.link/ipfs/',
 ];
 
-const alertedTokens = new Set();
+// ─── CACHE ───────────────────────────────────────────────────────────────────
+
+function loadCache() {
+  try {
+    if (existsSync(CACHE_FILE)) {
+      const data = JSON.parse(readFileSync(CACHE_FILE, 'utf8'));
+      const cutoff = Date.now() - 72 * 3600 * 1000; // 72hr window
+      const clean = {};
+      for (const [k, v] of Object.entries(data)) {
+        if (v > cutoff) clean[k] = v;
+      }
+      return clean;
+    }
+  } catch {}
+  return {};
+}
+
+function saveCache(cache) {
+  try { writeFileSync(CACHE_FILE, JSON.stringify(cache)); } catch {}
+}
 
 // ─── IPFS ────────────────────────────────────────────────────────────────────
 
 function getIPFSHash(uri) {
   if (!uri) return null;
   if (uri.startsWith('ipfs://')) return uri.replace('ipfs://', '');
-  const match = uri.match(/\/ipfs\/(.+)/);
-  return match ? match[1] : null;
+  const m = uri.match(/\/ipfs\/(.+)/);
+  return m ? m[1] : null;
 }
 
 async function fetchIPFSMetadata(uri) {
@@ -32,55 +57,44 @@ async function fetchIPFSMetadata(uri) {
   const urls = hash ? IPFS_GATEWAYS.map(g => g + hash) : [uri];
   for (const url of urls) {
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(7000) });
-      if (res.ok) {
-        try { return await res.json(); } catch {}
-      }
+      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      if (res.ok) { try { return await res.json(); } catch {} }
     } catch {}
   }
   return null;
 }
 
-// ─── SOCIAL EXTRACTION ───────────────────────────────────────────────────────
+// ─── SOCIALS ─────────────────────────────────────────────────────────────────
 
-function isValidTwitterAccount(url) {
+function isValidTwitter(url) {
   if (!url) return false;
-  // Must be twitter.com/x.com + username
-  // Exclude communities, search, hashtags, status pages
-  const invalid = /\/(communities|search|hashtag|status|explore|home|notifications|messages|i\/)/i;
-  const match = url.match(/https?:\/\/(twitter\.com|x\.com)\/([a-zA-Z0-9_]+)/);
-  if (!match) return false;
-  if (invalid.test(url)) return false;
-  const username = match[2];
-  // Skip reserved Twitter paths
-  const reserved = ['home', 'explore', 'notifications', 'messages', 'search', 'settings', 'login', 'i'];
-  if (reserved.includes(username.toLowerCase())) return false;
-  return true;
+  const m = url.match(/https?:\/\/(twitter\.com|x\.com)\/([a-zA-Z0-9_]+)/);
+  if (!m) return false;
+  const reserved = ['home', 'explore', 'notifications', 'messages', 'search',
+    'settings', 'login', 'i', 'communities', 'hashtag', 'intent', 'share'];
+  return !reserved.includes(m[2].toLowerCase());
 }
 
 function extractSocials(data) {
   if (!data) return null;
   const str = JSON.stringify(data);
 
-  // Telegram - required
   const tgMatch = str.match(/https?:\/\/t\.me\/[a-zA-Z0-9_@+]+/);
   const telegram = tgMatch ? tgMatch[0] : null;
 
-  if (!telegram) return null; // Telegram is mandatory
-
-  // Twitter/X - must be a real account
   const twMatches = str.match(/https?:\/\/(twitter\.com|x\.com)\/[a-zA-Z0-9_/]+/g) || [];
-  const twitter = twMatches.find(u => isValidTwitterAccount(u)) || null;
+  const twitter = twMatches.find(isValidTwitter) || null;
 
-  // Website - exclude known non-project domains
-  const excluded = /twitter|x\.com|t\.me|ipfs|pump\.fun|dexscreener|cloudflare|pinata|solana|arweave|birdeye|jupiter|raydium|meteora|discord\.gg/i;
+  const excluded = /twitter|x\.com|t\.me|ipfs|pump\.fun|dexscreener|cloudflare|pinata|solana|arweave|birdeye|jupiter|raydium|meteora|discord\.gg|google|apple|github|instagram|youtube|tiktok|reddit/i;
   const webMatches = str.match(/https?:\/\/[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s"',]*/g) || [];
   const website = webMatches.find(u => !excluded.test(u)) || null;
 
+  // Need at least one social
+  if (!telegram && !twitter && !website) return null;
   return { telegram, twitter, website };
 }
 
-// ─── FORMATTING ──────────────────────────────────────────────────────────────
+// ─── FORMAT ──────────────────────────────────────────────────────────────────
 
 function formatMcap(usd) {
   if (!usd || usd === 0) return 'Unknown';
@@ -89,107 +103,105 @@ function formatMcap(usd) {
   return '$' + usd.toFixed(0);
 }
 
-function chainEmoji(chain) {
-  const map = {
-    solana: '🟣', ethereum: '🔵', bsc: '🟡', base: '🔷',
-    arbitrum: '🔶', polygon: '🟪', avalanche: '🔴', tron: '🔴'
-  };
-  return map[chain?.toLowerCase()] || '⚪';
-}
+// ─── ALERT ───────────────────────────────────────────────────────────────────
 
-// ─── TELEGRAM ALERT ──────────────────────────────────────────────────────────
+async function sendAlert(token, socials, mcapUsd) {
+  const name = token.name || 'Unknown';
+  const ticker = token.symbol || '???';
+  const ca = token.mint || 'N/A';
 
-async function sendAlert({ name, ticker, ca, mcapUsd, socials, source, link, chain }) {
-  const emoji = chainEmoji(chain);
-  const sourceTag = source === 'pumpfun' ? 'Pump.fun' : `DexScreener (${chain?.toUpperCase() || 'unknown'})`;
-  const hasFull = socials.telegram && socials.twitter && socials.website;
-  const quality = hasFull ? '🔥' : socials.website ? '⭐' : '✅';
+  const quality = socials.telegram && socials.twitter && socials.website ? '🔥'
+    : socials.telegram && (socials.twitter || socials.website) ? '⭐'
+    : socials.telegram ? '📱'
+    : socials.twitter ? '🐦'
+    : '🌐';
 
   const lines = [
-    `${quality} *EARLY TOKEN ALERT*`,
-    `${emoji} ${sourceTag}`,
+    `${quality} *EARLY PUMP.FUN ALERT*`,
     ``,
     `*${name}* — $${ticker}`,
     `💰 MCap: ${formatMcap(mcapUsd)}`,
     `📋 CA: \`${ca}\``,
     ``,
-    `📱 Telegram: ${socials.telegram}`,
   ];
 
+  if (socials.telegram) lines.push(`📱 Telegram: ${socials.telegram}`);
   if (socials.website) lines.push(`🌐 Website: ${socials.website}`);
   if (socials.twitter) lines.push(`🐦 Twitter: ${socials.twitter}`);
 
-  lines.push(``);
-  lines.push(`🔗 ${link}`);
-
-  const message = lines.join('\n');
-  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+  lines.push(``, `🔗 https://pump.fun/${ca}`);
 
   try {
-    const res = await fetch(url, {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id: CHAT_ID,
-        text: message,
+        text: lines.join('\n'),
         parse_mode: 'Markdown',
         disable_web_page_preview: true
       })
     });
-    if (!res.ok) console.error('Telegram send error:', await res.text());
-    else console.log(`✅ Alert: ${name} ($${ticker}) [${sourceTag}] MCap: ${formatMcap(mcapUsd)}`);
+    if (!res.ok) console.error('TG error:', await res.text());
+    else console.log(`✅ ${name} ($${ticker}) MCap:${formatMcap(mcapUsd)} TG:${!!socials.telegram} X:${!!socials.twitter} WEB:${!!socials.website}`);
   } catch (err) {
-    console.error('Failed to send alert:', err.message);
+    console.error('Send failed:', err.message);
   }
 }
 
-// ─── PUMP.FUN SCANNER ────────────────────────────────────────────────────────
+// ─── PROCESS TOKEN ───────────────────────────────────────────────────────────
 
-async function processPumpToken(token) {
-  const name = token.name || '???';
+async function processToken(token, cache) {
   const ca = token.mint;
-  if (!ca || alertedTokens.has(ca)) return;
+  if (!ca || cache[ca]) return;
 
-  const mcapUsd = (token.marketCapSol || 0) * 150;
-  if (mcapUsd > MAX_MCAP_USD && mcapUsd !== 0) return;
+  const mcapUsd = (token.usd_market_cap || 0) || ((token.marketCapSol || 0) * 150);
 
-  if (!token.uri) return;
+  // Skip if mcap too high (allow unknown mcap through)
+  if (mcapUsd > MAX_MCAP_USD && mcapUsd > 0) return;
 
-  const metadata = await fetchIPFSMetadata(token.uri);
-  const socials = extractSocials(metadata);
-  if (!socials) {
-    console.log(`  No TG: ${name}`);
+  const uri = token.uri || token.image_uri;
+  if (!uri) {
+    // Mark as seen even without URI
+    cache[ca] = Date.now();
     return;
   }
 
-  alertedTokens.add(ca);
-  await sendAlert({
-    name,
-    ticker: token.symbol || '???',
-    ca,
-    mcapUsd,
-    socials,
-    source: 'pumpfun',
-    link: `https://pump.fun/${ca}`,
-    chain: 'solana'
-  });
+  const metadata = await fetchIPFSMetadata(uri);
+
+  // Also check token fields directly (some tokens have socials in root)
+  const combined = { ...token, ...(metadata || {}) };
+  const socials = extractSocials(combined);
+
+  // Mark as seen regardless
+  cache[ca] = Date.now();
+
+  if (!socials) {
+    console.log(`  No socials: ${token.name || ca.slice(0, 8)}`);
+    return;
+  }
+
+  await sendAlert(token, socials, mcapUsd);
+  await new Promise(r => setTimeout(r, 400));
 }
 
-async function scanPumpFun() {
+// ─── WEBSOCKET SCANNER ────────────────────────────────────────────────────────
+
+async function scanWebSocket(cache) {
   return new Promise((resolve) => {
-    console.log('📡 Connecting to pump.fun WebSocket...');
+    console.log('📡 pump.fun WebSocket connecting...');
     const ws = new WebSocket('wss://pumpportal.fun/api/data');
     let count = 0;
     const queue = [];
 
     ws.on('open', () => {
-      console.log('✅ pump.fun connected');
+      console.log('✅ WebSocket connected');
       ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
 
       setTimeout(async () => {
         ws.close();
         await Promise.allSettled(queue);
-        console.log(`pump.fun: processed ${count} tokens`);
+        console.log(`WebSocket: ${count} tokens processed`);
         resolve();
       }, LISTEN_DURATION_MS);
     });
@@ -199,118 +211,81 @@ async function scanPumpFun() {
         const token = JSON.parse(data.toString());
         if (!token.mint) return;
         count++;
-        console.log(`[pump] ${token.name || '???'}`);
-        queue.push(processPumpToken(token));
+        console.log(`[ws] ${token.name || '???'} — MCap: ${formatMcap((token.marketCapSol || 0) * 150)}`);
+        queue.push(processToken(token, cache));
       } catch {}
     });
 
-    ws.on('error', (err) => { console.error('pump.fun error:', err.message); resolve(); });
+    ws.on('error', (err) => { console.error('WS error:', err.message); resolve(); });
     ws.on('close', () => resolve());
   });
 }
 
-// ─── DEXSCREENER SCANNER (ALL CHAINS) ────────────────────────────────────────
+// ─── REST API SCANNER (catches tokens WebSocket might miss) ──────────────────
 
-async function scanDexScreener() {
-  console.log('\n📡 Scanning DexScreener (all chains)...');
+async function scanRestAPI(cache) {
+  console.log('\n📡 Scanning pump.fun REST API (recent tokens)...');
 
-  try {
-    const res = await fetch('https://api.dexscreener.com/token-profiles/latest/v1', {
-      headers: { 'Accept': 'application/json' },
-      signal: AbortSignal.timeout(10000)
-    });
+  // Try multiple API versions and offsets for maximum coverage
+  const requests = [
+    'https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false',
+    'https://frontend-api-v3.pump.fun/coins?offset=50&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false',
+    'https://frontend-api-v2.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false',
+  ];
 
-    if (!res.ok) { console.log('DexScreener error:', res.status); return; }
+  for (const url of requests) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        },
+        signal: AbortSignal.timeout(10000)
+      });
 
-    const tokens = await res.json();
-    if (!Array.isArray(tokens)) { console.log('DexScreener bad format'); return; }
-
-    console.log(`DexScreener: ${tokens.length} profiles across all chains`);
-
-    for (const token of tokens) {
-      const ca = token.tokenAddress;
-      const chain = token.chainId;
-      if (!ca || !chain || alertedTokens.has(`${chain}:${ca}`)) continue;
-
-      // Extract socials from links array
-      const links = token.links || [];
-      let telegram = null, twitter = null, website = null;
-
-      for (const link of links) {
-        const u = link.url || '';
-        if (u.includes('t.me') && !telegram) telegram = u;
-        else if ((u.includes('twitter.com') || u.includes('x.com')) && isValidTwitterAccount(u) && !twitter) twitter = u;
-        else if (link.type === 'website' && !website) website = u;
-      }
-
-      // Also scan description for t.me links
-      if (!telegram && token.description) {
-        const m = token.description.match(/https?:\/\/t\.me\/[a-zA-Z0-9_@+]+/);
-        if (m) telegram = m[0];
-      }
-
-      // Telegram required
-      if (!telegram) continue;
-
-      // Get pair data for mcap
-      let mcapUsd = 0;
-      try {
-        const pairRes = await fetch(
-          `https://api.dexscreener.com/latest/dex/tokens/${ca}`,
-          { signal: AbortSignal.timeout(6000) }
-        );
-        if (pairRes.ok) {
-          const pairData = await pairRes.json();
-          const pairs = pairData.pairs || [];
-          // Get the pair with highest liquidity
-          const bestPair = pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
-          mcapUsd = bestPair?.marketCap || bestPair?.fdv || 0;
-        }
-      } catch {}
-
-      // Apply mcap filter only if we got a valid mcap
-      if (mcapUsd > MAX_MCAP_USD && mcapUsd !== 0) {
-        console.log(`  Skip high mcap: ${ca.slice(0,8)} (${formatMcap(mcapUsd)})`);
+      if (!res.ok) {
+        console.log(`  API ${res.status}: ${url.split('?')[0]}`);
         continue;
       }
 
-      alertedTokens.add(`${chain}:${ca}`);
+      const data = await res.json();
+      const tokens = Array.isArray(data) ? data : (data.coins || []);
 
-      const name = token.description?.split('\n')[0]?.slice(0, 40) || 'Unknown';
-      console.log(`  🎯 dex match: ${name} [${chain}] MCap: ${formatMcap(mcapUsd)}`);
+      if (tokens.length === 0) continue;
 
-      await sendAlert({
-        name,
-        ticker: ca.slice(0, 6),
-        ca,
-        mcapUsd,
-        socials: { telegram, twitter, website },
-        source: 'dexscreener',
-        link: `https://dexscreener.com/${chain}/${ca}`,
-        chain
-      });
+      console.log(`  Got ${tokens.length} tokens from REST`);
 
-      await new Promise(r => setTimeout(r, 400));
+      const queue = tokens.map(t => processToken(t, cache));
+      await Promise.allSettled(queue);
+      break; // If one works, we're good
+
+    } catch (e) {
+      console.log(`  REST failed: ${e.message}`);
     }
-
-  } catch (err) {
-    console.error('DexScreener scan error:', err.message);
   }
 }
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log('🟢 TG Radar — pump.fun + DexScreener (all chains)');
-  console.log(`Filter: Telegram required | under $${MAX_MCAP_USD.toLocaleString()} mcap\n`);
+  console.log('🟢 TG Radar — Aggressive pump.fun Scanner');
+  console.log(`Filter: Any social link | Max mcap $${MAX_MCAP_USD.toLocaleString()}\n`);
 
   if (!TELEGRAM_TOKEN || !CHAT_ID) {
-    console.error('❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
+    console.error('❌ Missing env vars');
     process.exit(1);
   }
 
-  await Promise.all([scanPumpFun(), scanDexScreener()]);
+  const cache = loadCache();
+  console.log(`Cache: ${Object.keys(cache).length} tokens already seen\n`);
 
+  // Run WebSocket and REST simultaneously
+  await Promise.all([
+    scanWebSocket(cache),
+    scanRestAPI(cache)
+  ]);
+
+  saveCache(cache);
   console.log('\n📊 All done.');
 }
 
